@@ -1,0 +1,29 @@
+# Claude Code internals
+.claude/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Database & cached data
+data/*.db
+data/*.csv
+
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
