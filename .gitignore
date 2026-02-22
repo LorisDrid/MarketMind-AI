@@ -27,3 +27,8 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Data & Cache
+data/
+*.csv
+*.json
