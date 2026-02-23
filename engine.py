@@ -41,6 +41,7 @@ class TradeResult:
     cash_after: float
     message: str
     sentiment_score: Optional[float] = None
+    strategy_name:   Optional[str]   = None
 
 
 @dataclass
@@ -93,12 +94,14 @@ class Engine:
         self,
         starting_cash: float = 10_000.0,
         db_path=None,
+        strategy_name: Optional[str] = None,
     ) -> None:
         kwargs = {"starting_cash": starting_cash}
         if db_path is not None:
             kwargs["db_path"] = db_path
         init_db(**kwargs)
-        self._db_path = db_path  # None → use module default
+        self._db_path       = db_path        # None → use module default
+        self._strategy_name = strategy_name  # tagged on every persisted trade
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -148,10 +151,12 @@ class Engine:
     ) -> None:
         conn.execute(
             """
-            INSERT INTO trades (ticker, type, price, quantity, sentiment_score)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO trades
+                (ticker, type, price, quantity, sentiment_score, strategy_name)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (ticker.upper(), trade_type, price, quantity, sentiment_score),
+            (ticker.upper(), trade_type, price, quantity,
+             sentiment_score, self._strategy_name),
         )
 
     # ------------------------------------------------------------------
@@ -246,6 +251,7 @@ class Engine:
             quantity=quantity, price=price, total_value=total_cost,
             cash_after=new_cash, message=msg,
             sentiment_score=sentiment_score,
+            strategy_name=self._strategy_name,
         )
 
     def sell(
@@ -333,6 +339,7 @@ class Engine:
             quantity=quantity, price=price, total_value=total_proceeds,
             cash_after=new_cash, message=msg,
             sentiment_score=sentiment_score,
+            strategy_name=self._strategy_name,
         )
 
     # ------------------------------------------------------------------

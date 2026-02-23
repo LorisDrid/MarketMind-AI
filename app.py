@@ -305,57 +305,68 @@ def _sentiment_gauge(score: float = 0.0) -> go.Figure:
 
 # ── Backtest helpers ───────────────────────────────────────────────────────
 
-def _load_backtest_equity(db_path: Path) -> tuple[pd.DataFrame, float]:
-    """Reconstruct equity curve from backtest.db by replaying trades.
+def _get_backtest_strategies(db_path: Path) -> list[str]:
+    """Return sorted list of distinct strategy_name values in the DB."""
+    try:
+        with get_connection(db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT strategy_name FROM trades "
+                "WHERE strategy_name IS NOT NULL ORDER BY strategy_name"
+            ).fetchall()
+        return [r["strategy_name"] for r in rows]
+    except Exception:
+        return []
 
-    Each BUY/SELL in the trades table has a matching cash-snapshot row in the
-    portfolio table (inserted atomically by the engine).  Zipping them lets us
-    compute ``portfolio_value = cash_after_trade + shares_held * trade_price``
-    at every event without storing the value explicitly in the schema.
+
+def _load_backtest_equity(
+    db_path: Path,
+    strategy_name: Optional[str] = None,
+    starting_cash: float = 10_000.0,
+    fee: float = 1.0,
+) -> tuple[pd.DataFrame, float]:
+    """Reconstruct equity curve by replaying the trades table.
+
+    Fully self-contained: does *not* rely on the portfolio table, so it
+    works correctly when filtering by strategy_name.
+
+    Args:
+        db_path:       Path to the SQLite backtest file.
+        strategy_name: If given, only replay trades for this profile.
+        starting_cash: Virtual starting balance (default $10 000).
+        fee:           Per-trade flat fee applied on every BUY and SELL.
 
     Returns:
-        (equity_df, init_cash)
+        (equity_df, starting_cash)
         equity_df columns: timestamp (datetime), portfolio_value (float),
                            action ("START" | "BUY" | "SELL")
     """
     with get_connection(db_path) as conn:
-        seed = conn.execute(
-            "SELECT current_cash FROM portfolio ORDER BY id ASC LIMIT 1"
-        ).fetchone()
-        init_cash = float(seed["current_cash"]) if seed else 10_000.0
-
-        trades = [
-            dict(r) for r in conn.execute(
-                "SELECT timestamp, ticker, type, price, quantity "
-                "FROM trades ORDER BY id ASC"
-            ).fetchall()
-        ]
-        # Portfolio rows after the seed (one inserted per trade)
-        cash_values = [
-            float(r["current_cash"])
-            for r in conn.execute(
-                "SELECT current_cash FROM portfolio ORDER BY id ASC LIMIT -1 OFFSET 1"
-            ).fetchall()
-        ]
+        base  = "SELECT timestamp, ticker, type, price, quantity FROM trades"
+        where = " WHERE strategy_name = ?" if strategy_name else ""
+        rows  = conn.execute(base + where + " ORDER BY id ASC",
+                             (strategy_name,) if strategy_name else ()).fetchall()
+        trades = [dict(r) for r in rows]
 
     if not trades:
-        return pd.DataFrame(), init_cash
+        return pd.DataFrame(), starting_cash
 
-    records = [{"timestamp": pd.NaT, "portfolio_value": init_cash, "action": "START"}]
+    records = [{"timestamp": pd.NaT, "portfolio_value": starting_cash, "action": "START"}]
+    cash: float = starting_cash
     shares_held: dict[str, float] = {}
 
-    for trade, cash in zip(trades, cash_values):
+    for trade in trades:
         t_ticker = trade["ticker"]
         t_type   = trade["type"]
         price    = float(trade["price"])
         qty      = float(trade["quantity"])
 
         if t_type == "BUY":
+            cash -= price * qty + fee
             shares_held[t_ticker] = shares_held.get(t_ticker, 0.0) + qty
         else:
+            cash += price * qty - fee
             shares_held[t_ticker] = max(0.0, shares_held.get(t_ticker, 0.0) - qty)
 
-        # For single-ticker backtests (current design): value = cash + held * price
         port_val = cash + shares_held.get(t_ticker, 0.0) * price
         records.append({
             "timestamp":       trade["timestamp"],
@@ -365,7 +376,7 @@ def _load_backtest_equity(db_path: Path) -> tuple[pd.DataFrame, float]:
 
     df = pd.DataFrame(records)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-    return df, init_cash
+    return df, starting_cash
 
 
 def _build_equity_chart(equity_df: pd.DataFrame) -> go.Figure:
@@ -436,6 +447,20 @@ with st.sidebar:
         ["📊 Live", "🔬 Backtest"],
         horizontal=True,
     )
+
+    # ── Strategy filter (visible only in Backtest mode) ─────────────────────
+    selected_strategy: Optional[str] = None
+    if mode == "🔬 Backtest":
+        bt_strategies = _get_backtest_strategies(BACKTEST_DB_PATH)
+        if bt_strategies:
+            st.divider()
+            st.subheader("Strategy Filter")
+            selected_strategy = st.selectbox(
+                "Profile",
+                bt_strategies,
+                key="bt_strategy_select",
+            )
+
     st.divider()
 
     # ── Controls ───────────────────────────────────────────────────────────
@@ -509,7 +534,9 @@ if mode == "🔬 Backtest":
         )
     else:
         try:
-            equity_df, bt_init_cash = _load_backtest_equity(BACKTEST_DB_PATH)
+            equity_df, bt_init_cash = _load_backtest_equity(
+                BACKTEST_DB_PATH, strategy_name=selected_strategy
+            )
 
             if equity_df.empty:
                 st.info("Backtest database exists but contains no trades yet.")
@@ -540,15 +567,20 @@ if mode == "🔬 Backtest":
                 # ── Backtest trade history ───────────────────────────────────
                 st.subheader("Trade History")
                 with get_connection(BACKTEST_DB_PATH) as _bt_conn:
+                    _strat_filter = (
+                        "WHERE strategy_name = ?" if selected_strategy else ""
+                    )
                     bt_trades = [
                         dict(r) for r in _bt_conn.execute(
-                            """
+                            f"""
                             SELECT timestamp, ticker, type, price,
                                    quantity, sentiment_score
                             FROM   trades
+                            {_strat_filter}
                             ORDER  BY id DESC
                             LIMIT  50
-                            """
+                            """,
+                            (selected_strategy,) if selected_strategy else (),
                         ).fetchall()
                     ]
                 if bt_trades:

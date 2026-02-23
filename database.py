@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS trades (
     type            TEXT    NOT NULL CHECK (type IN ('BUY', 'SELL')),
     price           REAL    NOT NULL,
     quantity        REAL    NOT NULL,
-    sentiment_score REAL             -- NULL when trade is not AI-driven
+    sentiment_score REAL,            -- NULL when trade is not AI-driven
+    strategy_name   TEXT             -- profile label (e.g. Prudent / Balanced / Aggressive)
 );
 """
 
@@ -72,6 +73,14 @@ def init_db(
     logger.info("Initialising database at %s", db_path)
     with get_connection(db_path) as conn:
         conn.executescript(_SCHEMA_SQL)
+
+        # ── Migrate: add strategy_name if upgrading an existing DB ─────────
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()
+        }
+        if "strategy_name" not in existing_cols:
+            conn.execute("ALTER TABLE trades ADD COLUMN strategy_name TEXT")
+            logger.info("Migrated trades table: added strategy_name column.")
 
         # Seed portfolio only when completely empty (first run)
         row_count: int = conn.execute("SELECT COUNT(*) FROM portfolio").fetchone()[0]

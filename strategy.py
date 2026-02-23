@@ -60,6 +60,39 @@ MIN_HOLD_BARS  = 4        # minimum bars held before a SELL is permitted
 STARTING_CASH  = 10_000.0
 DB_PATH        = "data/backtest.db"
 
+# ── Strategy profiles ─────────────────────────────────────────────────────────
+# Each profile is a self-contained parameter set; all three share the same
+# signal logic but differ in aggressiveness / risk tolerance.
+
+PROFILES: dict[str, dict] = {
+    "Prudent": {
+        "sentiment_buy":  0.50,   # high conviction: needs strong positive signal
+        "sentiment_sell": -0.20,  # only exits on clearly negative sentiment
+        "sma_window":     20,     # standard 20-bar SMA
+        "sma_buffer":     0.990,  # 1 % below SMA before technical SELL fires
+        "min_hold_bars":  6,      # longer cooldown — avoids shaking out early
+        "buy_shares":     3.0,    # smaller position = lower exposure
+    },
+    "Balanced": {
+        "sentiment_buy":  0.30,   # current production defaults
+        "sentiment_sell": -0.10,
+        "sma_window":     20,
+        "sma_buffer":     0.995,  # 0.5 % buffer
+        "min_hold_bars":  4,
+        "buy_shares":     5.0,
+    },
+    "Aggressive": {
+        "sentiment_buy":  0.15,   # enters on weak positive signal
+        "sentiment_sell": -0.05,  # exits quickly on any negative drift
+        "sma_window":     10,     # faster SMA reacts sooner
+        "sma_buffer":     0.998,  # near-zero buffer — tight stops
+        "min_hold_bars":  2,      # short cooldown allows rapid re-entry
+        "buy_shares":     8.0,    # larger position = higher upside / downside
+    },
+}
+
+DEFAULT_PROFILE = "Balanced"
+
 
 # ── News helpers (timestamp-aware) ───────────────────────────────────────────
 
@@ -161,6 +194,7 @@ def run_backtest(
     period:        str   = "60d",
     interval:      str   = "1h",
     db_path:       str   = DB_PATH,
+    profile_name:  str   = DEFAULT_PROFILE,
 ) -> list[dict]:
     """Simulate trading decisions over historical 1-hour bars.
 
@@ -178,6 +212,7 @@ def run_backtest(
                        warm-up (e.g. ``"7d"`` for a 5-day backtest).
         interval:      Bar size — strategy is designed for ``"1h"``.
         db_path:       SQLite file path for trade persistence.
+        profile_name:  One of the keys in ``PROFILES`` (default: "Balanced").
 
     Returns:
         List of per-bar dicts.  Each dict contains:
@@ -186,7 +221,19 @@ def run_backtest(
         Returns an empty list on unrecoverable data failure.
     """
     ticker = ticker.upper()
-    logger.info("run_backtest: %s | %s → %s", ticker, start_date, end_date)
+    logger.info(
+        "run_backtest: %s | %s → %s  [profile: %s]",
+        ticker, start_date, end_date, profile_name,
+    )
+
+    # ── 0. Resolve profile parameters ────────────────────────────────────────
+    profile      = PROFILES.get(profile_name, PROFILES[DEFAULT_PROFILE])
+    p_sent_buy   = profile["sentiment_buy"]
+    p_sent_sell  = profile["sentiment_sell"]
+    p_sma_window = profile["sma_window"]
+    p_sma_buffer = profile["sma_buffer"]
+    p_min_hold   = profile["min_hold_bars"]
+    p_buy_shares = profile["buy_shares"]
 
     # ── 1. Load OHLCV via data_manager ───────────────────────────────────────
     df = get_historical_data(ticker, period=period, interval=interval)
@@ -212,13 +259,17 @@ def run_backtest(
         return []
 
     # Pre-compute SMA_20 across the sliced window (rolling — no look-ahead)
-    df["SMA_20"] = _compute_sma(df["Close"])
+    df["SMA_20"] = _compute_sma(df["Close"], window=p_sma_window)
 
     # ── 2. Fetch timestamped news once (filtered per bar) ────────────────────
     news_items = _fetch_timestamped_news(ticker)
 
-    # ── 3. Initialise engine ─────────────────────────────────────────────────
-    engine = Engine(starting_cash=starting_cash, db_path=db_path)
+    # ── 3. Initialise engine (tagged with profile so every trade is labelled) ──
+    engine = Engine(
+        starting_cash=starting_cash,
+        db_path=db_path,
+        strategy_name=profile_name,
+    )
 
     # ── 4. Step through each hourly bar ──────────────────────────────────────
     results: list[dict] = []
@@ -258,12 +309,12 @@ def run_backtest(
         holding = held_qty > 0
         cash    = portfolio.cash
 
-        # ── Signal evaluation ────────────────────────────────────────────────
-        buy_signal  = (sentiment > SENTIMENT_BUY) and (price > sma20)
-        # Buffer zone: require price to fall 0.5 % below SMA_20 to filter noise
-        sell_signal = (sentiment < SENTIMENT_SELL) or (holding and price < sma20 * 0.995)
-        # Cooldown: block SELL until MIN_HOLD_BARS bars have elapsed since BUY
-        cooldown_ok = bars_since_buy >= MIN_HOLD_BARS
+        # ── Signal evaluation (profile-parameterised) ────────────────────────
+        buy_signal  = (sentiment > p_sent_buy) and (price > sma20)
+        # Buffer zone: price must fall p_sma_buffer below SMA before technical SELL
+        sell_signal = (sentiment < p_sent_sell) or (holding and price < sma20 * p_sma_buffer)
+        # Cooldown: block SELL until p_min_hold bars have elapsed since BUY
+        cooldown_ok = bars_since_buy >= p_min_hold
 
         action       = "HOLD"
         trade_result = None
@@ -280,7 +331,7 @@ def run_backtest(
                 bars_since_buy = 0  # reset counter after position is closed
 
         elif buy_signal and not holding:
-            qty = BUY_SHARES
+            qty = p_buy_shares
             # Account for transaction fee in the affordability check
             if price * qty + TRANSACTION_FEE > cash:
                 # Fallback: spend at most CASH_FRACTION of available cash
@@ -331,7 +382,12 @@ def run_backtest(
 # ── Report printer ────────────────────────────────────────────────────────────
 
 
-def _print_report(ticker: str, results: list[dict], starting_cash: float) -> None:
+def _print_report(
+    ticker: str,
+    results: list[dict],
+    starting_cash: float,
+    profile_name: str = "",
+) -> None:
     """Print a concise backtest summary to stdout."""
     if not results:
         print("No results to display.")
@@ -346,7 +402,8 @@ def _print_report(ticker: str, results: list[dict], starting_cash: float) -> Non
     n_sell = sum(1 for r in results if r["action"] == "SELL")
 
     print(f"\n{SEP}")
-    print(f"  Backtest Report — {ticker}")
+    label = f"  [{profile_name}]" if profile_name else ""
+    print(f"  Backtest Report — {ticker}{label}")
     print(SEP)
     print(f"  Period         : {first['timestamp'][:10]}  →  {last['timestamp'][:10]}")
     print(f"  Bars processed : {len(results)}")
@@ -382,6 +439,8 @@ if __name__ == "__main__":
     from datetime import timedelta
     from pathlib import Path
 
+    from database import get_connection  # for per-profile DB reset
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -400,20 +459,38 @@ if __name__ == "__main__":
         help="Number of calendar days to simulate (end = today)",
     )
     parser.add_argument(
+        "--profile",
+        default=DEFAULT_PROFILE,
+        choices=list(PROFILES.keys()),
+        help="Strategy profile to run",
+    )
+    parser.add_argument(
         "--db", default=DB_PATH,
-        help="SQLite output path for the backtest results",
+        help="SQLite output path (shared across profiles)",
     )
     args = parser.parse_args()
 
-    # ── Clear any stale backtest DB before starting fresh ────────────────────
+    # ── Per-profile DB reset ──────────────────────────────────────────────────
+    # Removes only this profile's previous trades so other profiles' data is
+    # preserved for comparison.  portfolio/positions are always reset so the
+    # engine starts with a clean $10 k slate regardless of prior runs.
     bt_path = Path(args.db)
     if bt_path.exists():
-        bt_path.unlink()
-        logger.info("Cleared existing backtest DB: %s", bt_path)
+        with get_connection(bt_path) as _conn:
+            _conn.execute(
+                "DELETE FROM trades WHERE strategy_name = ?", (args.profile,)
+            )
+            _conn.execute("DELETE FROM portfolio")
+            _conn.execute("DELETE FROM positions")
+            _conn.execute(
+                "INSERT INTO portfolio (current_cash) VALUES (?)", (STARTING_CASH,)
+            )
+            _conn.commit()
+        logger.info("Reset profile '%s' in %s", args.profile, bt_path)
 
     end   = datetime.now(timezone.utc).date()
     start = end - timedelta(days=args.days)
-    # Fetch extra days so SMA_20 has enough warm-up bars before the sim window
+    # Extra fetch window ensures SMA warm-up bars exist before the sim window
     fetch_period = f"{args.days + 5}d"
 
     results = run_backtest(
@@ -423,7 +500,8 @@ if __name__ == "__main__":
         starting_cash=STARTING_CASH,
         period=fetch_period,
         db_path=args.db,
+        profile_name=args.profile,
     )
 
-    _print_report(args.ticker, results, STARTING_CASH)
+    _print_report(args.ticker, results, STARTING_CASH, profile_name=args.profile)
     sys.exit(0 if results else 1)
