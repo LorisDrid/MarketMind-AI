@@ -95,6 +95,7 @@ _BLUE  = "#4e8df5"
 _AMBER = "#f39c12"
 
 BACKTEST_DB_PATH = Path("data/backtest.db")
+BACKTEST_PROFILE_NAMES: list[str] = ["Prudent", "Balanced", "Aggressive"]
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────
@@ -318,20 +319,40 @@ def _get_backtest_strategies(db_path: Path) -> list[str]:
         return []
 
 
+def _get_backtest_tickers(db_path: Path) -> list[str]:
+    """Return sorted list of distinct tickers that have trades in the DB."""
+    try:
+        if not db_path.exists():
+            return []
+        with get_connection(db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT ticker FROM trades "
+                "WHERE ticker IS NOT NULL ORDER BY ticker"
+            ).fetchall()
+        return [r["ticker"] for r in rows]
+    except Exception:
+        return []
+
+
 def _load_backtest_equity(
     db_path: Path,
     strategy_name: Optional[str] = None,
+    bt_ticker: Optional[str] = None,
     starting_cash: float = 10_000.0,
     fee: float = 1.0,
 ) -> tuple[pd.DataFrame, float]:
     """Reconstruct equity curve by replaying the trades table.
 
     Fully self-contained: does *not* rely on the portfolio table, so it
-    works correctly when filtering by strategy_name.
+    works correctly when filtering by strategy_name and/or ticker.
+
+    The START anchor point is fetched from ``backtest_meta`` so the X-axis
+    begins at the simulation period start rather than the first trade.
 
     Args:
         db_path:       Path to the SQLite backtest file.
         strategy_name: If given, only replay trades for this profile.
+        bt_ticker:     If given, only replay trades for this ticker.
         starting_cash: Virtual starting balance (default $10 000).
         fee:           Per-trade flat fee applied on every BUY and SELL.
 
@@ -341,16 +362,52 @@ def _load_backtest_equity(
                            action ("START" | "BUY" | "SELL")
     """
     with get_connection(db_path) as conn:
-        base  = "SELECT timestamp, ticker, type, price, quantity FROM trades"
-        where = " WHERE strategy_name = ?" if strategy_name else ""
-        rows  = conn.execute(base + where + " ORDER BY id ASC",
-                             (strategy_name,) if strategy_name else ()).fetchall()
+        # ── Build trades query with optional filters ──────────────────────────
+        conditions: list[str] = []
+        params: list = []
+        if strategy_name:
+            conditions.append("strategy_name = ?")
+            params.append(strategy_name)
+        if bt_ticker:
+            conditions.append("ticker = ?")
+            params.append(bt_ticker)
+        where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        rows = conn.execute(
+            "SELECT timestamp, ticker, type, price, quantity FROM trades"
+            + where_clause + " ORDER BY id ASC",
+            params,
+        ).fetchall()
         trades = [dict(r) for r in rows]
+
+        # ── Fetch simulation start from backtest_meta for X-axis anchoring ────
+        sim_start_ts = None
+        meta_conditions: list[str] = []
+        meta_params: list = []
+        if strategy_name:
+            meta_conditions.append("profile_name = ?")
+            meta_params.append(strategy_name)
+        if bt_ticker:
+            meta_conditions.append("ticker = ?")
+            meta_params.append(bt_ticker)
+        meta_where = (" WHERE " + " AND ".join(meta_conditions)) if meta_conditions else ""
+        try:
+            meta_row = conn.execute(
+                "SELECT MIN(sim_start) AS sim_start FROM backtest_meta" + meta_where,
+                meta_params,
+            ).fetchone()
+            if meta_row and meta_row["sim_start"]:
+                sim_start_ts = pd.Timestamp(meta_row["sim_start"], tz="UTC")
+        except Exception:
+            pass  # backtest_meta may not exist on older databases
 
     if not trades:
         return pd.DataFrame(), starting_cash
 
-    records = [{"timestamp": pd.NaT, "portfolio_value": starting_cash, "action": "START"}]
+    records = [{
+        "timestamp":       sim_start_ts if sim_start_ts is not None else pd.NaT,
+        "portfolio_value": starting_cash,
+        "action":          "START",
+    }]
     cash: float = starting_cash
     shares_held: dict[str, float] = {}
 
@@ -448,75 +505,86 @@ with st.sidebar:
         horizontal=True,
     )
 
-    # ── Strategy filter (visible only in Backtest mode) ─────────────────────
-    selected_strategy: Optional[str] = None
-    if mode == "🔬 Backtest":
-        bt_strategies = _get_backtest_strategies(BACKTEST_DB_PATH)
-        if bt_strategies:
-            st.divider()
-            st.subheader("Strategy Filter")
-            selected_strategy = st.selectbox(
-                "Profile",
-                bt_strategies,
-                key="bt_strategy_select",
-            )
-
     st.divider()
 
-    # ── Controls ───────────────────────────────────────────────────────────
-    ticker: str  = st.selectbox("Ticker", TICKERS, index=0)
-    period: str  = st.selectbox("Period", list(_PERIOD_INTERVAL.keys()), index=1)
-    interval: str = _PERIOD_INTERVAL[period]
-    st.caption(f"Auto interval: `{interval}`")
+    if mode == "📊 Live":
+        # ── Live controls ──────────────────────────────────────────────────────
+        ticker: str   = st.selectbox("Ticker", TICKERS, index=0)
+        period: str   = st.selectbox("Period", list(_PERIOD_INTERVAL.keys()), index=1)
+        interval: str = _PERIOD_INTERVAL[period]
+        st.caption(f"Auto interval: `{interval}`")
 
-    chart_type: str = st.radio("Chart type", ["Candlestick", "Line"], horizontal=True)
+        chart_type: str = st.radio("Chart type", ["Candlestick", "Line"], horizontal=True)
 
-    if st.button("🔄  Refresh data", use_container_width=True):
-        st.cache_data.clear()
-        st.session_state["last_refresh"] = datetime.now()
-        st.rerun()
+        if st.button("🔄  Refresh data", use_container_width=True):
+            st.cache_data.clear()
+            st.session_state["last_refresh"] = datetime.now()
+            st.rerun()
 
-    last_ref: datetime = st.session_state["last_refresh"]
-    st.caption(f"⏱ Last updated: **{last_ref.strftime('%H:%M:%S')}**")
+        last_ref: datetime = st.session_state["last_refresh"]
+        st.caption(f"⏱ Last updated: **{last_ref.strftime('%H:%M:%S')}**")
 
-    st.divider()
+        st.divider()
 
-    # ── Open Positions ─────────────────────────────────────────────────────
-    st.subheader("Open Positions")
-    engine  = _engine()
-    portfolio = engine.get_portfolio()
+        # ── Open Positions ─────────────────────────────────────────────────────
+        st.subheader("Open Positions")
+        engine    = _engine()
+        portfolio = engine.get_portfolio()
 
-    if portfolio.positions:
-        for pos in portfolio.positions:
-            live = _price(pos.ticker)
-            if live:
-                live_val = live * pos.quantity
-                cost_val = pos.average_buy_price * pos.quantity
-                pnl      = live_val - cost_val
-                pnl_pct  = (pnl / cost_val * 100) if cost_val else 0.0
-                st.metric(
-                    label       =f"{pos.ticker}  ·  {pos.quantity:g} sh",
-                    value       =fmt_usd(live_val),
-                    delta       =_pnl_delta(pnl, pnl_pct),
-                    delta_color ="normal",   # green +, red −
-                )
-            else:
-                st.metric(
-                    label=f"{pos.ticker}  ·  {pos.quantity:g} sh",
-                    value=fmt_usd(pos.market_value),
-                    help ="Live price unavailable — showing cost-basis value.",
-                )
-    else:
-        st.caption("No open positions.")
+        if portfolio.positions:
+            for pos in portfolio.positions:
+                live = _price(pos.ticker)
+                if live:
+                    live_val = live * pos.quantity
+                    cost_val = pos.average_buy_price * pos.quantity
+                    pnl      = live_val - cost_val
+                    pnl_pct  = (pnl / cost_val * 100) if cost_val else 0.0
+                    st.metric(
+                        label       =f"{pos.ticker}  ·  {pos.quantity:g} sh",
+                        value       =fmt_usd(live_val),
+                        delta       =_pnl_delta(pnl, pnl_pct),
+                        delta_color ="normal",
+                    )
+                else:
+                    st.metric(
+                        label=f"{pos.ticker}  ·  {pos.quantity:g} sh",
+                        value=fmt_usd(pos.market_value),
+                        help ="Live price unavailable — showing cost-basis value.",
+                    )
+        else:
+            st.caption("No open positions.")
 
-    st.divider()
+        st.divider()
 
-    # ── Sentiment Gauge (Ollama placeholder) ───────────────────────────────
-    st.subheader("Market Sentiment")
-    # score will be injected by strategy.py / Ollama in the next milestone
-    sentiment_score: float = st.session_state.get("sentiment_score", 0.0)
-    st.plotly_chart(_sentiment_gauge(sentiment_score), use_container_width=True)
-    st.caption("⏳ Ollama (local LLM) scoring — coming in `strategy.py`")
+        # ── Sentiment Gauge (Ollama placeholder) ───────────────────────────────
+        st.subheader("Market Sentiment")
+        sentiment_score: float = st.session_state.get("sentiment_score", 0.0)
+        st.plotly_chart(_sentiment_gauge(sentiment_score), use_container_width=True)
+        st.caption("⏳ Ollama (local LLM) scoring — coming in `strategy.py`")
+
+    else:  # mode == "🔬 Backtest"
+        # ── Backtest controls: all 3 profiles always visible regardless of DB ──
+        st.subheader("Strategy Profile")
+        selected_strategy: str = st.selectbox(
+            "Profile",
+            BACKTEST_PROFILE_NAMES,
+            key="bt_strategy_select",
+        )
+
+        st.divider()
+
+        # ── Ticker filter: populated from trades already in the DB ─────────────
+        _bt_tickers: list[str]    = _get_backtest_tickers(BACKTEST_DB_PATH)
+        _ticker_opts: list[str]   = ["All tickers"] + _bt_tickers
+        _sel_ticker_label: str    = st.selectbox(
+            "Ticker Filter",
+            _ticker_opts,
+            key="bt_ticker_select",
+        )
+        bt_ticker: Optional[str] = (
+            None if _sel_ticker_label == "All tickers"
+            else _sel_ticker_label
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -525,21 +593,30 @@ with st.sidebar:
 
 # ── Backtest mode: render analysis then stop ────────────────────────────────
 if mode == "🔬 Backtest":
-    st.header("Backtest Analysis")
+    _ticker_label = bt_ticker or "All tickers"
+    st.header(f"🔬 Backtest Analysis  —  {selected_strategy}  ·  {_ticker_label}")
 
     if not BACKTEST_DB_PATH.exists():
         st.warning(
             "No backtest data found. "
-            "Run `python strategy.py` first to generate `data/backtest.db`."
+            "Run `python strategy.py` to generate `data/backtest.db`."
         )
     else:
         try:
             equity_df, bt_init_cash = _load_backtest_equity(
-                BACKTEST_DB_PATH, strategy_name=selected_strategy
+                BACKTEST_DB_PATH,
+                strategy_name=selected_strategy,
+                bt_ticker=bt_ticker,
             )
 
             if equity_df.empty:
-                st.info("Backtest database exists but contains no trades yet.")
+                _ticker_hint = f"--ticker {bt_ticker}" if bt_ticker else "--ticker NVDA"
+                st.info("No trades executed for this profile with current settings.")
+                st.code(
+                    f"python strategy.py --profile {selected_strategy} "
+                    f"{_ticker_hint} --days 7",
+                    language="bash",
+                )
             else:
                 final_val        = equity_df["portfolio_value"].iloc[-1]
                 total_return_pct = (final_val - bt_init_cash) / bt_init_cash * 100
@@ -567,8 +644,16 @@ if mode == "🔬 Backtest":
                 # ── Backtest trade history ───────────────────────────────────
                 st.subheader("Trade History")
                 with get_connection(BACKTEST_DB_PATH) as _bt_conn:
-                    _strat_filter = (
-                        "WHERE strategy_name = ?" if selected_strategy else ""
+                    _bt_conds: list[str] = []
+                    _bt_params: list     = []
+                    if selected_strategy:
+                        _bt_conds.append("strategy_name = ?")
+                        _bt_params.append(selected_strategy)
+                    if bt_ticker:
+                        _bt_conds.append("ticker = ?")
+                        _bt_params.append(bt_ticker)
+                    _bt_where = (
+                        "WHERE " + " AND ".join(_bt_conds) if _bt_conds else ""
                     )
                     bt_trades = [
                         dict(r) for r in _bt_conn.execute(
@@ -576,11 +661,11 @@ if mode == "🔬 Backtest":
                             SELECT timestamp, ticker, type, price,
                                    quantity, sentiment_score
                             FROM   trades
-                            {_strat_filter}
+                            {_bt_where}
                             ORDER  BY id DESC
                             LIMIT  50
                             """,
-                            (selected_strategy,) if selected_strategy else (),
+                            _bt_params,
                         ).fetchall()
                     ]
                 if bt_trades:

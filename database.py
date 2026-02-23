@@ -40,6 +40,19 @@ CREATE TABLE IF NOT EXISTS trades (
     sentiment_score REAL,            -- NULL when trade is not AI-driven
     strategy_name   TEXT             -- profile label (e.g. Prudent / Balanced / Aggressive)
 );
+
+-- Backtest simulation metadata: one row per (profile_name, ticker) run.
+-- Stores the simulation window so the dashboard equity curve can be anchored
+-- to the period start rather than the first trade.
+CREATE TABLE IF NOT EXISTS backtest_meta (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_name  TEXT NOT NULL,
+    ticker        TEXT NOT NULL,
+    sim_start     TEXT NOT NULL,
+    sim_end       TEXT NOT NULL,
+    recorded_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(profile_name, ticker)
+);
 """
 
 

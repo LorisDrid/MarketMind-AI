@@ -3,8 +3,8 @@ strategy.py — Sentiment + Technical backtest strategy runner.
 
 Signal logic per 1-hour bar
 ────────────────────────────
-  BUY  : sentiment_score > 0.3  AND  close_price > SMA_20
-  SELL : sentiment_score < -0.1  OR  (close_price < SMA_20 * 0.995 AND position held)
+  BUY  : sentiment_score >= profile.sentiment_buy  AND  close_price > SMA_20
+  SELL : sentiment_score <= profile.sentiment_sell  OR  (close_price < SMA_20 * buffer AND position held)
          subject to MIN_HOLD_BARS cooldown since the last BUY
 
 Position sizing
@@ -43,6 +43,7 @@ from typing import Optional
 import pandas as pd
 import yfinance as yf
 
+from database import get_connection
 from data_manager import get_historical_data
 from engine import Engine, TRANSACTION_FEE
 from sentiment_analyzer import get_sentiment
@@ -183,6 +184,46 @@ def _compute_sma(series: pd.Series, window: int = SMA_WINDOW) -> pd.Series:
     return series.rolling(window=window, min_periods=1).mean()
 
 
+# ── Sim metadata ──────────────────────────────────────────────────────────────
+
+
+def _store_sim_meta(
+    db_path: str,
+    profile_name: str,
+    ticker: str,
+    sim_start: str,
+    sim_end: str,
+) -> None:
+    """Upsert simulation period metadata into ``backtest_meta``.
+
+    Called once per ``run_backtest`` execution so the dashboard equity curve
+    can anchor its X-axis to the simulation start rather than the first trade.
+
+    The UPSERT ensures the row for ``(profile_name, ticker)`` always reflects
+    the *most recent* run window.
+    """
+    try:
+        with get_connection(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO backtest_meta (profile_name, ticker, sim_start, sim_end)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(profile_name, ticker) DO UPDATE SET
+                    sim_start   = excluded.sim_start,
+                    sim_end     = excluded.sim_end,
+                    recorded_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (profile_name, ticker, sim_start, sim_end),
+            )
+            conn.commit()
+        logger.debug(
+            "Stored sim meta: %s / %s [%s → %s]",
+            profile_name, ticker, sim_start, sim_end,
+        )
+    except Exception as exc:
+        logger.warning("Could not store sim meta: %s", exc)
+
+
 # ── Core backtest loop ────────────────────────────────────────────────────────
 
 
@@ -271,6 +312,11 @@ def run_backtest(
         strategy_name=profile_name,
     )
 
+    # ── 3b. Record simulation period metadata ─────────────────────────────────
+    # Stored now (before any trades) so the dashboard equity curve can anchor
+    # its X-axis to the simulation start even when zero trades were executed.
+    _store_sim_meta(db_path, profile_name, ticker, start_date, end_date)
+
     # ── 4. Step through each hourly bar ──────────────────────────────────────
     results: list[dict] = []
 
@@ -310,9 +356,9 @@ def run_backtest(
         cash    = portfolio.cash
 
         # ── Signal evaluation (profile-parameterised) ────────────────────────
-        buy_signal  = (sentiment > p_sent_buy) and (price > sma20)
+        buy_signal  = (sentiment >= p_sent_buy) and (price > sma20)
         # Buffer zone: price must fall p_sma_buffer below SMA before technical SELL
-        sell_signal = (sentiment < p_sent_sell) or (holding and price < sma20 * p_sma_buffer)
+        sell_signal = (sentiment <= p_sent_sell) or (holding and price < sma20 * p_sma_buffer)
         # Cooldown: block SELL until p_min_hold bars have elapsed since BUY
         cooldown_ok = bars_since_buy >= p_min_hold
 
@@ -439,8 +485,6 @@ if __name__ == "__main__":
     from datetime import timedelta
     from pathlib import Path
 
-    from database import get_connection  # for per-profile DB reset
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -485,6 +529,14 @@ if __name__ == "__main__":
             _conn.execute(
                 "INSERT INTO portfolio (current_cash) VALUES (?)", (STARTING_CASH,)
             )
+            # Clear stale sim-period metadata for this profile so the equity
+            # curve X-axis reflects the new run, not a previous one.
+            try:
+                _conn.execute(
+                    "DELETE FROM backtest_meta WHERE profile_name = ?", (args.profile,)
+                )
+            except Exception:
+                pass  # table may not exist on a very first run
             _conn.commit()
         logger.info("Reset profile '%s' in %s", args.profile, bt_path)
 
