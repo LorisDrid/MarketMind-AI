@@ -148,14 +148,18 @@ class Engine:
         price: float,
         quantity: float,
         sentiment_score: Optional[float],
+        timestamp: Optional[str] = None,
     ) -> None:
+        # Use the caller-supplied timestamp (simulation bar time) when provided;
+        # fall back to wall-clock 'now' for live / manual trades.
+        ts = timestamp if timestamp is not None else datetime.now(timezone.utc).isoformat()
         conn.execute(
             """
             INSERT INTO trades
-                (ticker, type, price, quantity, sentiment_score, strategy_name)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (timestamp, ticker, type, price, quantity, sentiment_score, strategy_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (ticker.upper(), trade_type, price, quantity,
+            (ts, ticker.upper(), trade_type, price, quantity,
              sentiment_score, self._strategy_name),
         )
 
@@ -169,6 +173,7 @@ class Engine:
         price: float,
         quantity: float,
         sentiment_score: Optional[float] = None,
+        timestamp: Optional[str] = None,
     ) -> TradeResult:
         """Purchase *quantity* shares of *ticker* at *price*.
 
@@ -177,6 +182,10 @@ class Engine:
             price: Current market price per share in USD.
             quantity: Number of shares to buy (fractional shares supported).
             sentiment_score: Optional AI sentiment in ``[-1.0, 1.0]``.
+            timestamp: ISO-8601 timestamp to record against this trade.
+                If omitted the current wall-clock time is used (live mode).
+                Pass the bar's close timestamp in backtest mode so the
+                dashboard plots trades at market time, not execution time.
 
         Returns:
             :class:`TradeResult` describing the outcome.
@@ -237,7 +246,7 @@ class Engine:
                     (total_qty, avg_price, ticker),
                 )
 
-            self._log_trade(conn, ticker, "BUY", price, quantity, sentiment_score)
+            self._log_trade(conn, ticker, "BUY", price, quantity, sentiment_score, timestamp)
             conn.commit()
 
         msg = (
@@ -260,6 +269,7 @@ class Engine:
         price: float,
         quantity: float,
         sentiment_score: Optional[float] = None,
+        timestamp: Optional[str] = None,
     ) -> TradeResult:
         """Sell *quantity* shares of *ticker* at *price*.
 
@@ -269,6 +279,10 @@ class Engine:
             quantity: Number of shares to sell.  Pass ``None`` (or omit) to
                 sell the entire position (handled at strategy layer).
             sentiment_score: Optional AI sentiment in ``[-1.0, 1.0]``.
+            timestamp: ISO-8601 timestamp to record against this trade.
+                If omitted the current wall-clock time is used (live mode).
+                Pass the bar's close timestamp in backtest mode so the
+                dashboard plots trades at market time, not execution time.
 
         Returns:
             :class:`TradeResult` describing the outcome.
@@ -325,7 +339,7 @@ class Engine:
                     (remaining_qty, ticker),
                 )
 
-            self._log_trade(conn, ticker, "SELL", price, quantity, sentiment_score)
+            self._log_trade(conn, ticker, "SELL", price, quantity, sentiment_score, timestamp)
             conn.commit()
 
         msg = (

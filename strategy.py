@@ -371,6 +371,7 @@ def run_backtest(
                 price=price,
                 quantity=held_qty,
                 sentiment_score=sentiment,
+                timestamp=timestamp.isoformat(),
             )
             action = "SELL" if trade_result.success else "HOLD"
             if action == "SELL":
@@ -388,6 +389,7 @@ def run_backtest(
                     price=price,
                     quantity=qty,
                     sentiment_score=sentiment,
+                    timestamp=timestamp.isoformat(),
                 )
                 action = "BUY" if trade_result.success else "HOLD"
                 if action == "BUY":
