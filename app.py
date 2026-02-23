@@ -326,13 +326,18 @@ def _get_backtest_strategies(db_path: Path) -> list[str]:
 
 
 def _get_backtest_tickers(db_path: Path) -> list[str]:
-    """Return sorted list of distinct tickers that have trades in the DB."""
+    """Return sorted list of distinct tickers that have a backtest_meta row.
+
+    Queries ``backtest_meta`` instead of ``trades`` so that simulations
+    with zero trades (e.g. no signal fired) still appear in the ticker filter.
+    Falls back to an empty list if the table does not exist yet.
+    """
     try:
         if not db_path.exists():
             return []
         with get_connection(db_path) as conn:
             rows = conn.execute(
-                "SELECT DISTINCT ticker FROM trades "
+                "SELECT DISTINCT ticker FROM backtest_meta "
                 "WHERE ticker IS NOT NULL ORDER BY ticker"
             ).fetchall()
         return [r["ticker"] for r in rows]
@@ -522,7 +527,7 @@ with st.sidebar:
 
         chart_type: str = st.radio("Chart type", ["Candlestick", "Line"], horizontal=True)
 
-        if st.button("🔄  Refresh data", use_container_width=True):
+        if st.button("🔄  Refresh data", width="stretch"):
             st.cache_data.clear()
             st.session_state["last_refresh"] = datetime.now()
             st.rerun()
@@ -565,7 +570,7 @@ with st.sidebar:
         # ── Sentiment Gauge (Ollama placeholder) ───────────────────────────────
         st.subheader("Market Sentiment")
         sentiment_score: float = st.session_state.get("sentiment_score", 0.0)
-        st.plotly_chart(_sentiment_gauge(sentiment_score), use_container_width=True)
+        st.plotly_chart(_sentiment_gauge(sentiment_score), width="stretch")
         st.caption("⏳ Ollama (local LLM) scoring — coming in `strategy.py`")
 
     else:  # mode == "🔬 Backtest"
@@ -643,7 +648,7 @@ if mode == "🔬 Backtest":
 
                 # ── Equity curve ────────────────────────────────────────────
                 st.subheader("Equity Curve")
-                st.plotly_chart(_build_equity_chart(equity_df), use_container_width=True)
+                st.plotly_chart(_build_equity_chart(equity_df), width="stretch")
 
                 st.divider()
 
@@ -689,7 +694,7 @@ if mode == "🔬 Backtest":
                     })
                     st.dataframe(
                         bt_df,
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                         column_config={
                             "Type"     : st.column_config.TextColumn(width="small"),
@@ -757,7 +762,7 @@ st.subheader(f"Price Chart  ·  {ticker}  ·  {period} / {interval}")
 df = _history(ticker, period, interval)
 
 if df is not None and not df.empty:
-    st.plotly_chart(_build_chart(df, ticker, chart_type), use_container_width=True)
+    st.plotly_chart(_build_chart(df, ticker, chart_type), width="stretch")
 else:
     st.warning(
         f"Could not load price data for **{ticker}**. "
@@ -806,7 +811,7 @@ with hist_col:
         })
         st.dataframe(
             hist_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Type"     : st.column_config.TextColumn(width="small"),
@@ -842,7 +847,7 @@ with st.form("trade_form", clear_on_submit=True):
         icon = "🟢" if action == "BUY" else "🔴"
         submitted: bool = st.form_submit_button(
             f"{icon}  Execute {action}",
-            use_container_width=True,
+            width="stretch",
             type="primary",
         )
 

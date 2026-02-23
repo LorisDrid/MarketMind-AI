@@ -3,9 +3,15 @@ strategy.py — Sentiment + Technical backtest strategy runner.
 
 Signal logic per 1-hour bar
 ────────────────────────────
-  BUY  : sentiment_score >= profile.sentiment_buy  AND  close_price > SMA_20
-  SELL : sentiment_score <= profile.sentiment_sell  OR  (close_price < SMA_20 * buffer AND position held)
-         subject to MIN_HOLD_BARS cooldown since the last BUY
+  BUY       : sentiment_score >= profile.sentiment_buy
+              AND  close_price > SMA_20
+              AND  RSI_14 < profile.rsi_overbought  (don't buy into overbought)
+  SELL      : sentiment_score <= profile.sentiment_sell
+              OR  (close_price < SMA_20 * buffer AND position held)
+              OR  (RSI_14 > profile.rsi_overbought AND position held)
+              subject to MIN_HOLD_BARS cooldown since the last BUY
+  STOP_LOSS : price <= entry_price * (1 − stop_loss_pct)
+              fires immediately, bypasses cooldown — highest priority
 
 Position sizing
 ───────────────
@@ -67,28 +73,40 @@ DB_PATH        = "data/backtest.db"
 
 PROFILES: dict[str, dict] = {
     "Prudent": {
-        "sentiment_buy":  0.50,   # high conviction: needs strong positive signal
-        "sentiment_sell": -0.20,  # only exits on clearly negative sentiment
-        "sma_window":     20,     # standard 20-bar SMA
-        "sma_buffer":     0.990,  # 1 % below SMA before technical SELL fires
-        "min_hold_bars":  6,      # longer cooldown — avoids shaking out early
-        "buy_shares":     3.0,    # smaller position = lower exposure
+        "sentiment_buy":   0.50,   # high conviction: needs strong positive signal
+        "sentiment_sell":  -0.20,  # only exits on clearly negative sentiment
+        "sma_window":      20,     # standard 20-bar SMA
+        "sma_buffer":      0.990,  # 1 % below SMA before technical SELL fires
+        "min_hold_bars":   6,      # longer cooldown — avoids shaking out early
+        "buy_shares":      3.0,    # smaller position = lower exposure
+        "stop_loss_pct":   0.03,   # 3 % stop-loss — wider buffer to avoid noise
+        "rsi_window":      14,     # standard Wilder RSI period
+        "rsi_oversold":    35,     # more conservative: wait for deeper oversold
+        "rsi_overbought":  65,     # exit sooner
     },
     "Balanced": {
-        "sentiment_buy":  0.30,   # current production defaults
-        "sentiment_sell": -0.10,
-        "sma_window":     20,
-        "sma_buffer":     0.995,  # 0.5 % buffer
-        "min_hold_bars":  4,
-        "buy_shares":     5.0,
+        "sentiment_buy":   0.30,   # current production defaults
+        "sentiment_sell":  -0.10,
+        "sma_window":      20,
+        "sma_buffer":      0.995,  # 0.5 % buffer
+        "min_hold_bars":   4,
+        "buy_shares":      5.0,
+        "stop_loss_pct":   0.02,   # 2 % stop-loss
+        "rsi_window":      14,
+        "rsi_oversold":    30,     # standard RSI thresholds
+        "rsi_overbought":  70,
     },
     "Aggressive": {
-        "sentiment_buy":  0.15,   # enters on weak positive signal
-        "sentiment_sell": -0.05,  # exits quickly on any negative drift
-        "sma_window":     10,     # faster SMA reacts sooner
-        "sma_buffer":     0.998,  # near-zero buffer — tight stops
-        "min_hold_bars":  2,      # short cooldown allows rapid re-entry
-        "buy_shares":     8.0,    # larger position = higher upside / downside
+        "sentiment_buy":   0.15,   # enters on weak positive signal
+        "sentiment_sell":  -0.05,  # exits quickly on any negative drift
+        "sma_window":      10,     # faster SMA reacts sooner
+        "sma_buffer":      0.998,  # near-zero buffer — tight stops
+        "min_hold_bars":   2,      # short cooldown allows rapid re-entry
+        "buy_shares":      8.0,    # larger position = higher upside / downside
+        "stop_loss_pct":   0.015,  # 1.5 % stop-loss — tightest risk control
+        "rsi_window":      14,
+        "rsi_oversold":    35,     # more frequent RSI signals
+        "rsi_overbought":  65,
     },
 }
 
@@ -190,6 +208,32 @@ def _compute_sma(series: pd.Series, window: int = SMA_WINDOW) -> pd.Series:
     return series.rolling(window=window, min_periods=1).mean()
 
 
+def _compute_rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    """Wilder's Relative Strength Index (RSI) over *series*.
+
+    Uses exponential smoothing (``alpha = 1/window``, Wilder's method) for
+    both the average gain and average loss.  Early bars (fewer than *window*
+    completed periods) are filled with ``50.0`` (neutral) to avoid NaN
+    propagation during the warm-up phase.
+
+    Args:
+        series: Close price series (``pd.Series``).
+        window: Look-back period in bars (default 14 — standard Wilder RSI).
+
+    Returns:
+        ``pd.Series`` of RSI values in ``[0, 100]``.
+    """
+    delta    = series.diff()
+    gain     = delta.clip(lower=0.0)
+    loss     = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / window, min_periods=window, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / window, min_periods=window, adjust=False).mean()
+    # Avoid division by zero: replace zero avg_loss with NaN so RS = NaN → RSI = 50
+    rs  = avg_gain / avg_loss.replace(0.0, float("nan"))
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.fillna(50.0)
+
+
 # ── Sim metadata ──────────────────────────────────────────────────────────────
 
 
@@ -281,13 +325,16 @@ def run_backtest(
         )
 
     # ── 0. Resolve profile parameters ────────────────────────────────────────
-    profile      = PROFILES.get(profile_name, PROFILES[DEFAULT_PROFILE])
-    p_sent_buy   = profile["sentiment_buy"]
-    p_sent_sell  = profile["sentiment_sell"]
-    p_sma_window = profile["sma_window"]
-    p_sma_buffer = profile["sma_buffer"]
-    p_min_hold   = profile["min_hold_bars"]
-    p_buy_shares = profile["buy_shares"]
+    profile          = PROFILES.get(profile_name, PROFILES[DEFAULT_PROFILE])
+    p_sent_buy       = profile["sentiment_buy"]
+    p_sent_sell      = profile["sentiment_sell"]
+    p_sma_window     = profile["sma_window"]
+    p_sma_buffer     = profile["sma_buffer"]
+    p_min_hold       = profile["min_hold_bars"]
+    p_buy_shares     = profile["buy_shares"]
+    p_stop_loss      = profile["stop_loss_pct"]
+    p_rsi_window     = profile["rsi_window"]
+    p_rsi_overbought = profile["rsi_overbought"]
 
     # ── 1. Load OHLCV via data_manager ───────────────────────────────────────
     df = get_historical_data(ticker, period=period, interval=interval)
@@ -312,8 +359,9 @@ def run_backtest(
         )
         return []
 
-    # Pre-compute SMA_20 across the sliced window (rolling — no look-ahead)
+    # Pre-compute SMA and RSI across the sliced window (rolling — no look-ahead)
     df["SMA_20"] = _compute_sma(df["Close"], window=p_sma_window)
+    df["RSI_14"] = _compute_rsi(df["Close"], window=p_rsi_window)
 
     # ── 2. Fetch timestamped news once (filtered per bar) ────────────────────
     news_items = _fetch_timestamped_news(ticker)
@@ -341,9 +389,13 @@ def run_backtest(
     # A SELL is only permitted once this reaches MIN_HOLD_BARS.
     bars_since_buy: int = 0
 
+    # Stop-loss tracking: entry_price is set on every BUY, cleared on every exit.
+    entry_price: float = 0.0
+
     for timestamp, row in df.iterrows():
         price: float = float(row["Close"])
         sma20: float = float(row["SMA_20"])
+        rsi14: float = float(row["RSI_14"])
 
         # News available at or before this bar's timestamp (no look-ahead)
         headlines = _headlines_at(news_items, cutoff=timestamp)
@@ -369,16 +421,54 @@ def run_backtest(
         cash    = portfolio.cash
 
         # ── Signal evaluation (profile-parameterised) ────────────────────────
-        buy_signal  = (sentiment >= p_sent_buy) and (price > sma20)
+
+        # Stop-loss: absolute priority — fires immediately, bypasses cooldown.
+        # Only active when we hold a position and have a recorded entry price.
+        stop_loss_triggered = (
+            holding
+            and entry_price > 0.0
+            and price <= entry_price * (1.0 - p_stop_loss)
+        )
+
+        buy_signal = (
+            (sentiment >= p_sent_buy)
+            and (price > sma20)
+            and (rsi14 < p_rsi_overbought)   # don't buy into an already overbought market
+        )
         # Buffer zone: price must fall p_sma_buffer below SMA before technical SELL
-        sell_signal = (sentiment <= p_sent_sell) or (holding and price < sma20 * p_sma_buffer)
-        # Cooldown: block SELL until p_min_hold bars have elapsed since BUY
+        # RSI overbought adds an additional exit condition
+        sell_signal = (
+            (sentiment <= p_sent_sell)
+            or (holding and price < sma20 * p_sma_buffer)
+            or (holding and rsi14 > p_rsi_overbought)
+        )
+        # Cooldown: block sentiment/technical SELL until p_min_hold bars have elapsed
         cooldown_ok = bars_since_buy >= p_min_hold
 
         action       = "HOLD"
         trade_result = None
 
-        if sell_signal and holding and cooldown_ok:
+        if stop_loss_triggered:
+            # Stop-loss fires regardless of cooldown — protect capital first
+            _saved_entry = entry_price  # capture before clearing
+            trade_result = engine.sell(
+                ticker=ticker,
+                price=price,
+                quantity=held_qty,
+                sentiment_score=sentiment,
+                timestamp=timestamp.isoformat(),
+            )
+            if trade_result.success:
+                action         = "STOP_LOSS"
+                bars_since_buy = 0
+                entry_price    = 0.0
+                drop_pct       = (1.0 - price / _saved_entry) * 100
+                logger.info(
+                    "[%s] STOP-LOSS triggered: price=%.2f  entry=%.2f  drop=%.2f%%",
+                    str(timestamp)[:16], price, _saved_entry, drop_pct,
+                )
+
+        elif sell_signal and holding and cooldown_ok:
             trade_result = engine.sell(
                 ticker=ticker,
                 price=price,
@@ -388,7 +478,8 @@ def run_backtest(
             )
             action = "SELL" if trade_result.success else "HOLD"
             if action == "SELL":
-                bars_since_buy = 0  # reset counter after position is closed
+                bars_since_buy = 0   # reset counter after position is closed
+                entry_price    = 0.0
 
         elif buy_signal and not holding:
             qty = p_buy_shares
@@ -406,7 +497,8 @@ def run_backtest(
                 )
                 action = "BUY" if trade_result.success else "HOLD"
                 if action == "BUY":
-                    bars_since_buy = 0  # start cooldown clock on open
+                    bars_since_buy = 0      # start cooldown clock on open
+                    entry_price    = price  # record entry for stop-loss tracking
 
         # ── Snapshot after action ────────────────────────────────────────────
         snap       = engine.get_portfolio()
@@ -424,6 +516,7 @@ def run_backtest(
             "timestamp":       timestamp.isoformat(),
             "price":           round(price, 4),
             "sma_20":          round(sma20, 4),
+            "rsi_14":          round(rsi14, 2),
             "sentiment":       round(sentiment, 4),
             "headlines_used":  len(headlines),
             "action":          action,
@@ -433,8 +526,8 @@ def run_backtest(
         })
 
         logger.debug(
-            "[%s] price=%.2f  sma=%.2f  sent=%+.3f  → %-4s  | port=$%.2f",
-            str(timestamp)[:16], price, sma20, sentiment, action, port_value,
+            "[%s] price=%.2f  sma=%.2f  rsi=%.1f  sent=%+.3f  → %-9s  | port=$%.2f",
+            str(timestamp)[:16], price, sma20, rsi14, sentiment, action, port_value,
         )
 
     return results
@@ -459,8 +552,9 @@ def _print_report(
     last  = results[-1]
 
     total_return = (last["portfolio_value"] - starting_cash) / starting_cash * 100
-    n_buy  = sum(1 for r in results if r["action"] == "BUY")
-    n_sell = sum(1 for r in results if r["action"] == "SELL")
+    n_buy       = sum(1 for r in results if r["action"] == "BUY")
+    n_sell      = sum(1 for r in results if r["action"] == "SELL")
+    n_stop_loss = sum(1 for r in results if r["action"] == "STOP_LOSS")
 
     print(f"\n{SEP}")
     label = f"  [{profile_name}]" if profile_name else ""
@@ -471,13 +565,13 @@ def _print_report(
     print(f"  Starting cash  : ${starting_cash:>10,.2f}")
     print(f"  Final value    : ${last['portfolio_value']:>10,.2f}")
     print(f"  Total return   : {total_return:>+10.2f}%")
-    print(f"  Trades (B / S) : {n_buy} buys  /  {n_sell} sells")
+    print(f"  Trades (B / S) : {n_buy} buys  /  {n_sell} sells  /  {n_stop_loss} stop-losses")
     print(f"  Shares held    : {last['shares_held']}")
     print(f"  Cash remaining : ${last['cash']:>10,.2f}")
     print(SEP)
 
     print("\n  Last 5 bars:")
-    header = f"  {'Timestamp':<20} {'Price':>8} {'SMA20':>8} {'Sent':>6} {'Action':>6} {'PortVal':>10}"
+    header = f"  {'Timestamp':<20} {'Price':>8} {'SMA20':>8} {'RSI':>5} {'Sent':>6} {'Action':>10} {'PortVal':>10}"
     print(header)
     print("  " + "-" * (len(header) - 2))
     for r in results[-5:]:
@@ -485,8 +579,9 @@ def _print_report(
             f"  {r['timestamp'][:19]:<20} "
             f"{r['price']:>8.2f} "
             f"{r['sma_20']:>8.2f} "
+            f"{r.get('rsi_14', 0):>5.1f} "
             f"{r['sentiment']:>+6.3f} "
-            f"{r['action']:>6} "
+            f"{r['action']:>10} "
             f"${r['portfolio_value']:>9,.2f}"
         )
     print()

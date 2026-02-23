@@ -170,7 +170,7 @@ def get_latest_price(ticker: str) -> Optional[float]:
     return None
 
 
-def get_ticker_news(ticker: str, max_items: int = 10) -> list[dict]:
+def get_ticker_news(ticker: str, max_items: int = 100) -> list[dict]:
     """Return recent news headlines for *ticker*.
 
     Each item is a dict with three keys:
@@ -182,9 +182,15 @@ def get_ticker_news(ticker: str, max_items: int = 10) -> list[dict]:
     Results are cached as JSON in ``data/cache/`` for
     :data:`NEWS_CACHE_TTL` seconds.
 
+    Note:
+        yfinance returns at most ~100 recent items regardless of *max_items*.
+        Historical news (>30 days old) is not available via this API; the
+        backtest strategy loop applies per-bar timestamp filtering on the
+        items returned here.
+
     Args:
         ticker:    Stock symbol, e.g. ``"NVDA"``.
-        max_items: Maximum number of headlines to return.
+        max_items: Maximum number of headlines to return (default 100).
 
     Returns:
         List of headline dicts; empty list on failure.

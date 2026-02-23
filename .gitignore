@@ -33,3 +33,6 @@ Thumbs.db
 data/
 *.csv
 *.json
+
+# Test fixtures that ARE tracked (override *.json above)
+!tests/sentiment_benchmark.json

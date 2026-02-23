@@ -1,0 +1,137 @@
+[
+  {
+    "ticker": "NVDA",
+    "headline": "NVIDIA reports record Q4 revenue of $22.1B, beating estimates by 14% on surging AI chip demand",
+    "human_label": 0.9
+  },
+  {
+    "ticker": "NVDA",
+    "headline": "NVIDIA stock surges 16% after multiple analyst upgrades to Strong Buy ahead of next-gen GPU launch",
+    "human_label": 0.82
+  },
+  {
+    "ticker": "NVDA",
+    "headline": "NVIDIA data center revenue grows 427% year-over-year; AI chip backlog extends well into 2025",
+    "human_label": 0.95
+  },
+  {
+    "ticker": "NVDA",
+    "headline": "NVIDIA misses Q2 estimates; gaming revenue down 28% on weakening consumer PC demand",
+    "human_label": -0.7
+  },
+  {
+    "ticker": "NVDA",
+    "headline": "Antitrust regulators launch formal probe into NVIDIA's dominance in the AI accelerator market",
+    "human_label": -0.6
+  },
+  {
+    "ticker": "NVDA",
+    "headline": "NVIDIA cuts forward guidance citing new US export restrictions on advanced AI chips shipped to China",
+    "human_label": -0.82
+  },
+  {
+    "ticker": "NVDA",
+    "headline": "NVIDIA announces 10-for-1 stock split; shares rise 7% on the news after market close",
+    "human_label": 0.5
+  },
+  {
+    "ticker": "NVDA",
+    "headline": "NVIDIA hosts annual GTC developer conference, unveiling next-generation Blackwell GPU architecture",
+    "human_label": 0.35
+  },
+  {
+    "ticker": "NVDA",
+    "headline": "NVIDIA quarterly SEC filing submitted on schedule with no material changes to risk disclosures",
+    "human_label": 0.0
+  },
+  {
+    "ticker": "TSLA",
+    "headline": "Tesla delivers record 484,507 vehicles in Q4, beating analyst consensus estimates by 8%",
+    "human_label": 0.85
+  },
+  {
+    "ticker": "TSLA",
+    "headline": "Tesla slashes Model Y prices globally by up to 20%, reigniting concerns over margin compression",
+    "human_label": -0.45
+  },
+  {
+    "ticker": "TSLA",
+    "headline": "Tesla misses Q1 delivery estimates; production bottleneck blamed on extended Berlin factory shutdown",
+    "human_label": -0.75
+  },
+  {
+    "ticker": "TSLA",
+    "headline": "Tesla faces NHTSA investigation covering 2 million vehicles over repeated autopilot safety failures",
+    "human_label": -0.65
+  },
+  {
+    "ticker": "TSLA",
+    "headline": "Tesla Q3 earnings miss; operating margin collapses to 7.6% from 17.2% in the year-ago period",
+    "human_label": -0.8
+  },
+  {
+    "ticker": "TSLA",
+    "headline": "Tesla Cybertruck receives record 200,000 pre-orders in first week following highly anticipated launch",
+    "human_label": 0.7
+  },
+  {
+    "ticker": "TSLA",
+    "headline": "Elon Musk confirms Tesla FSD Beta 12 has now completed 5 million miles of real-world public road testing",
+    "human_label": 0.6
+  },
+  {
+    "ticker": "TSLA",
+    "headline": "Tesla expands global Supercharger network to 50,000 stations and opens access to all EV brands",
+    "human_label": 0.3
+  },
+  {
+    "ticker": "TSLA",
+    "headline": "Tesla renews its Austin headquarters lease for another five years at current terms",
+    "human_label": 0.0
+  },
+  {
+    "ticker": "BTC-USD",
+    "headline": "Bitcoin surpasses $100,000 milestone for the first time ever, driven by record institutional inflows",
+    "human_label": 0.95
+  },
+  {
+    "ticker": "BTC-USD",
+    "headline": "SEC approves first spot Bitcoin ETF applications; BlackRock and Fidelity set to launch products immediately",
+    "human_label": 0.9
+  },
+  {
+    "ticker": "BTC-USD",
+    "headline": "MicroStrategy announces $1 billion Bitcoin purchase, bringing total corporate holdings to 214,400 BTC",
+    "human_label": 0.75
+  },
+  {
+    "ticker": "BTC-USD",
+    "headline": "El Salvador becomes the first country in the world to adopt Bitcoin as official legal tender",
+    "human_label": 0.6
+  },
+  {
+    "ticker": "BTC-USD",
+    "headline": "Bitcoin drops 18% in a single session as Mt.Gox creditors begin distributing $9B in long-frozen BTC",
+    "human_label": -0.8
+  },
+  {
+    "ticker": "BTC-USD",
+    "headline": "Major cryptocurrency exchange FTX files for Chapter 11 bankruptcy; CEO Sam Bankman-Fried arrested for fraud",
+    "human_label": -0.95
+  },
+  {
+    "ticker": "BTC-USD",
+    "headline": "China bans all cryptocurrency trading and mining operations; Bitcoin falls 10% on the announcement",
+    "human_label": -0.72
+  },
+  {
+    "ticker": "BTC-USD",
+    "headline": "Bitcoin network hash rate reaches all-time high as miners upgrade to latest-generation ASICs",
+    "human_label": 0.4
+  },
+  {
+    "ticker": "BTC-USD",
+    "headline": "Bitcoin completes scheduled halving event, cutting block reward from 6.25 BTC to 3.125 BTC",
+    "human_label": 0.25
+  }
+]
