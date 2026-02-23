@@ -42,12 +42,13 @@ CREATE TABLE IF NOT EXISTS trades (
 """
 
 
-def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
+def get_connection(db_path: str | Path = DB_PATH) -> sqlite3.Connection:
     """Return a new SQLite connection with foreign keys enabled.
 
     Callers are responsible for committing / closing the connection.
     Using :func:`contextlib.closing` or a ``with`` block is recommended.
     """
+    db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row  # Allow column access by name

@@ -38,11 +38,7 @@ marketmind/
 ```bash
 python -m venv .venv
 
-# Windows
-.venv\Scripts\activate
-
-# macOS / Linux
-source .venv/bin/activate
+source .venv/Scripts/activate
 ```
 
 ### 2. Install dependencies
