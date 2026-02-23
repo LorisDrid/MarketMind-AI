@@ -4,12 +4,20 @@ strategy.py — Sentiment + Technical backtest strategy runner.
 Signal logic per 1-hour bar
 ────────────────────────────
   BUY  : sentiment_score > 0.3  AND  close_price > SMA_20
-  SELL : sentiment_score < -0.1  OR  (close_price < SMA_20 AND position held)
+  SELL : sentiment_score < -0.1  OR  (close_price < SMA_20 * 0.995 AND position held)
+         subject to MIN_HOLD_BARS cooldown since the last BUY
 
 Position sizing
 ───────────────
   BUY  → BUY_SHARES shares; falls back to CASH_FRACTION of cash if underfunded
   SELL → full position (all shares held)
+
+Whipsaw / hysteresis protection
+─────────────────────────────────
+  Buffer zone  : SELL on technical only fires when price drops 0.5 % below SMA_20
+                 (not right at the SMA), reducing false reversals on flat markets.
+  Cooldown     : MIN_HOLD_BARS bars must elapse after every BUY before any SELL
+                 is permitted, preventing rapid round-trips on noisy signals.
 
 Look-ahead bias prevention
 ───────────────────────────
@@ -20,6 +28,10 @@ Look-ahead bias prevention
            format), so we call yf.Ticker.news once here and filter per step.
   Caching: if the news set is unchanged between two bars, the previous
            sentiment score is reused to avoid redundant LLM calls.
+
+CLI usage
+─────────
+  python strategy.py --ticker NVDA --days 7
 """
 
 from __future__ import annotations
@@ -32,18 +44,19 @@ import pandas as pd
 import yfinance as yf
 
 from data_manager import get_historical_data
-from engine import Engine
+from engine import Engine, TRANSACTION_FEE
 from sentiment_analyzer import get_sentiment
 
 logger = logging.getLogger(__name__)
 
 # ── Strategy constants ────────────────────────────────────────────────────────
 
-SMA_WINDOW    = 20       # bars for the Simple Moving Average
-BUY_SHARES    = 5.0      # fixed position size per buy signal
-CASH_FRACTION = 0.10     # fallback: fraction of cash to deploy
-SENTIMENT_BUY  = 0.3     # score must exceed this to trigger BUY
-SENTIMENT_SELL = -0.1    # score must be below this to trigger SELL
+SMA_WINDOW     = 20       # bars for the Simple Moving Average
+BUY_SHARES     = 5.0      # fixed position size per buy signal
+CASH_FRACTION  = 0.10     # fallback: fraction of cash to deploy
+SENTIMENT_BUY  = 0.3      # score must exceed this to trigger BUY
+SENTIMENT_SELL = -0.1     # score must be below this to trigger SELL
+MIN_HOLD_BARS  = 4        # minimum bars held before a SELL is permitted
 STARTING_CASH  = 10_000.0
 DB_PATH        = "data/backtest.db"
 
@@ -214,6 +227,10 @@ def run_backtest(
     _prev_headlines: frozenset[str] = frozenset()
     _cached_sentiment: float = 0.0
 
+    # Cooldown counter: bars elapsed since the last successful BUY.
+    # A SELL is only permitted once this reaches MIN_HOLD_BARS.
+    bars_since_buy: int = 0
+
     for timestamp, row in df.iterrows():
         price: float = float(row["Close"])
         sma20: float = float(row["SMA_20"])
@@ -242,13 +259,16 @@ def run_backtest(
         cash    = portfolio.cash
 
         # ── Signal evaluation ────────────────────────────────────────────────
-        buy_signal  = (sentiment > SENTIMENT_BUY)  and (price > sma20)
-        sell_signal = (sentiment < SENTIMENT_SELL) or (holding and price < sma20)
+        buy_signal  = (sentiment > SENTIMENT_BUY) and (price > sma20)
+        # Buffer zone: require price to fall 0.5 % below SMA_20 to filter noise
+        sell_signal = (sentiment < SENTIMENT_SELL) or (holding and price < sma20 * 0.995)
+        # Cooldown: block SELL until MIN_HOLD_BARS bars have elapsed since BUY
+        cooldown_ok = bars_since_buy >= MIN_HOLD_BARS
 
         action       = "HOLD"
         trade_result = None
 
-        if sell_signal and holding:
+        if sell_signal and holding and cooldown_ok:
             trade_result = engine.sell(
                 ticker=ticker,
                 price=price,
@@ -256,10 +276,13 @@ def run_backtest(
                 sentiment_score=sentiment,
             )
             action = "SELL" if trade_result.success else "HOLD"
+            if action == "SELL":
+                bars_since_buy = 0  # reset counter after position is closed
 
         elif buy_signal and not holding:
             qty = BUY_SHARES
-            if price * qty > cash:
+            # Account for transaction fee in the affordability check
+            if price * qty + TRANSACTION_FEE > cash:
                 # Fallback: spend at most CASH_FRACTION of available cash
                 qty = (cash * CASH_FRACTION) / price if price > 0 else 0.0
             if qty > 0:
@@ -270,6 +293,8 @@ def run_backtest(
                     sentiment_score=sentiment,
                 )
                 action = "BUY" if trade_result.success else "HOLD"
+                if action == "BUY":
+                    bars_since_buy = 0  # start cooldown clock on open
 
         # ── Snapshot after action ────────────────────────────────────────────
         snap       = engine.get_portfolio()
@@ -278,6 +303,10 @@ def run_backtest(
             0.0,
         )
         port_value = snap.cash + held_after * price
+
+        # Advance the cooldown counter on every bar where a position is held
+        if held_after > 0:
+            bars_since_buy += 1
 
         results.append({
             "timestamp":       timestamp.isoformat(),
@@ -348,26 +377,53 @@ def _print_report(ticker: str, results: list[dict], starting_cash: float) -> Non
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
     import sys
     from datetime import timedelta
+    from pathlib import Path
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    TICKER = "NVDA"
-    end    = datetime.now(timezone.utc).date()
-    start  = end - timedelta(days=5)
+    parser = argparse.ArgumentParser(
+        description="MarketMind AI — Backtest runner",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--ticker", default="NVDA",
+        help="Stock ticker symbol to simulate",
+    )
+    parser.add_argument(
+        "--days", type=int, default=5,
+        help="Number of calendar days to simulate (end = today)",
+    )
+    parser.add_argument(
+        "--db", default=DB_PATH,
+        help="SQLite output path for the backtest results",
+    )
+    args = parser.parse_args()
+
+    # ── Clear any stale backtest DB before starting fresh ────────────────────
+    bt_path = Path(args.db)
+    if bt_path.exists():
+        bt_path.unlink()
+        logger.info("Cleared existing backtest DB: %s", bt_path)
+
+    end   = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=args.days)
+    # Fetch extra days so SMA_20 has enough warm-up bars before the sim window
+    fetch_period = f"{args.days + 5}d"
 
     results = run_backtest(
-        ticker=TICKER,
+        ticker=args.ticker,
         start_date=str(start),
         end_date=str(end),
         starting_cash=STARTING_CASH,
-        period="7d",          # 7-day fetch gives SMA_20 warm-up bars
-        db_path=DB_PATH,
+        period=fetch_period,
+        db_path=args.db,
     )
 
-    _print_report(TICKER, results, STARTING_CASH)
+    _print_report(args.ticker, results, STARTING_CASH)
     sys.exit(0 if results else 1)

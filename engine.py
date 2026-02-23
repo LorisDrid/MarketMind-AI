@@ -18,6 +18,10 @@ from database import get_connection, init_db
 
 logger = logging.getLogger(__name__)
 
+# Flat fee (USD) charged on every BUY and SELL execution.
+# Simulates realistic broker commissions / spread costs.
+TRANSACTION_FEE: float = 1.0
+
 
 # ---------------------------------------------------------------------------
 # Data-transfer objects
@@ -192,10 +196,11 @@ class Engine:
                 ).fetchone()["current_cash"]
             )
 
-            if total_cost > cash:
+            if total_cost + TRANSACTION_FEE > cash:
                 msg = (
                     f"BUY {ticker}: insufficient funds "
-                    f"(need ${total_cost:.2f}, have ${cash:.2f})."
+                    f"(need ${total_cost + TRANSACTION_FEE:.2f} incl. fee, "
+                    f"have ${cash:.2f})."
                 )
                 logger.warning(msg)
                 return TradeResult(
@@ -205,7 +210,7 @@ class Engine:
                     sentiment_score=sentiment_score,
                 )
 
-            new_cash = cash - total_cost
+            new_cash = cash - total_cost - TRANSACTION_FEE
             self._set_cash(conn, new_cash)
 
             existing = self._get_position(conn, ticker)
@@ -232,7 +237,8 @@ class Engine:
 
         msg = (
             f"BUY {quantity:.4f} {ticker} @ ${price:.4f} "
-            f"(total ${total_cost:.2f}) → cash ${new_cash:.2f}"
+            f"(total ${total_cost:.2f} + ${TRANSACTION_FEE:.2f} fee) "
+            f"→ cash ${new_cash:.2f}"
         )
         logger.info(msg)
         return TradeResult(
@@ -301,7 +307,7 @@ class Engine:
                     "SELECT current_cash FROM portfolio ORDER BY id DESC LIMIT 1"
                 ).fetchone()["current_cash"]
             )
-            new_cash = cash + total_proceeds
+            new_cash = cash + total_proceeds - TRANSACTION_FEE
             self._set_cash(conn, new_cash)
 
             remaining_qty = existing.quantity - quantity
@@ -318,7 +324,8 @@ class Engine:
 
         msg = (
             f"SELL {quantity:.4f} {ticker} @ ${price:.4f} "
-            f"(proceeds ${total_proceeds:.2f}) → cash ${new_cash:.2f}"
+            f"(proceeds ${total_proceeds:.2f} − ${TRANSACTION_FEE:.2f} fee) "
+            f"→ cash ${new_cash:.2f}"
         )
         logger.info(msg)
         return TradeResult(
