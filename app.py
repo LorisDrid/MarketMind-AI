@@ -71,7 +71,11 @@ st.markdown(
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────
-TICKERS: list[str] = ["NVDA", "AAPL", "MSFT", "TSLA"]
+TICKERS: list[str] = ["NVDA", "TSLA", "BTC-USD", "ETH-USD", "SQQQ"]
+
+# Crypto tickers trade 24 / 7 — their charts must NOT have market-session
+# rangebreaks or weekend gaps will incorrectly erase valid price data.
+_CRYPTO_TICKERS: frozenset[str] = frozenset({"BTC-USD", "ETH-USD"})
 
 _PERIOD_INTERVAL: dict[str, str] = {
     "1d" : "5m",
@@ -233,9 +237,11 @@ def _build_chart(df: pd.DataFrame, ticker: str, chart_type: str) -> go.Figure:
         ),
     )
 
-    # Rangebreaks applied to all x-axes (both subplots share ET data)
+    # Apply market-session rangebreaks for equities only.
+    # Crypto trades 24/7 — passing rangebreaks would incorrectly hide weekend bars.
+    _rb = [] if ticker in _CRYPTO_TICKERS else _RANGEBREAKS
     fig.update_xaxes(
-        rangebreaks=_RANGEBREAKS,
+        rangebreaks=_rb,
         showgrid=False,
         linecolor="rgba(255,255,255,0.1)",
         color="#777",

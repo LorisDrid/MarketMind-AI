@@ -94,6 +94,12 @@ PROFILES: dict[str, dict] = {
 
 DEFAULT_PROFILE = "Balanced"
 
+# Tickers that trade continuously (no market-session gaps in OHLCV data).
+# yfinance returns 24/7 hourly bars for these; no special SMA treatment is
+# needed because the rolling window operates on consecutive bars regardless
+# of whether gaps exist — but we log the mode for clarity.
+_CRYPTO_TICKERS: frozenset[str] = frozenset({"BTC-USD", "ETH-USD"})
+
 
 # ── News helpers (timestamp-aware) ───────────────────────────────────────────
 
@@ -262,10 +268,17 @@ def run_backtest(
         Returns an empty list on unrecoverable data failure.
     """
     ticker = ticker.upper()
+    _mode = "24/7 crypto" if ticker in _CRYPTO_TICKERS else "equity"
     logger.info(
-        "run_backtest: %s | %s → %s  [profile: %s]",
-        ticker, start_date, end_date, profile_name,
+        "run_backtest: %s | %s → %s  [profile: %s | mode: %s]",
+        ticker, start_date, end_date, profile_name, _mode,
     )
+    if ticker in _CRYPTO_TICKERS:
+        logger.info(
+            "%s is a crypto ticker: OHLCV bars are continuous 24/7 — "
+            "no market-session gaps; SMA and signals operate on all bars.",
+            ticker,
+        )
 
     # ── 0. Resolve profile parameters ────────────────────────────────────────
     profile      = PROFILES.get(profile_name, PROFILES[DEFAULT_PROFILE])
