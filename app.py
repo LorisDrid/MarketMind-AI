@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -92,6 +93,8 @@ _GREEN = "#2ecc71"
 _RED   = "#e74c3c"
 _BLUE  = "#4e8df5"
 _AMBER = "#f39c12"
+
+BACKTEST_DB_PATH = Path("data/backtest.db")
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────
@@ -300,6 +303,120 @@ def _sentiment_gauge(score: float = 0.0) -> go.Figure:
     return fig
 
 
+# ── Backtest helpers ───────────────────────────────────────────────────────
+
+def _load_backtest_equity(db_path: Path) -> tuple[pd.DataFrame, float]:
+    """Reconstruct equity curve from backtest.db by replaying trades.
+
+    Each BUY/SELL in the trades table has a matching cash-snapshot row in the
+    portfolio table (inserted atomically by the engine).  Zipping them lets us
+    compute ``portfolio_value = cash_after_trade + shares_held * trade_price``
+    at every event without storing the value explicitly in the schema.
+
+    Returns:
+        (equity_df, init_cash)
+        equity_df columns: timestamp (datetime), portfolio_value (float),
+                           action ("START" | "BUY" | "SELL")
+    """
+    with get_connection(db_path) as conn:
+        seed = conn.execute(
+            "SELECT current_cash FROM portfolio ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+        init_cash = float(seed["current_cash"]) if seed else 10_000.0
+
+        trades = [
+            dict(r) for r in conn.execute(
+                "SELECT timestamp, ticker, type, price, quantity "
+                "FROM trades ORDER BY id ASC"
+            ).fetchall()
+        ]
+        # Portfolio rows after the seed (one inserted per trade)
+        cash_values = [
+            float(r["current_cash"])
+            for r in conn.execute(
+                "SELECT current_cash FROM portfolio ORDER BY id ASC LIMIT -1 OFFSET 1"
+            ).fetchall()
+        ]
+
+    if not trades:
+        return pd.DataFrame(), init_cash
+
+    records = [{"timestamp": pd.NaT, "portfolio_value": init_cash, "action": "START"}]
+    shares_held: dict[str, float] = {}
+
+    for trade, cash in zip(trades, cash_values):
+        t_ticker = trade["ticker"]
+        t_type   = trade["type"]
+        price    = float(trade["price"])
+        qty      = float(trade["quantity"])
+
+        if t_type == "BUY":
+            shares_held[t_ticker] = shares_held.get(t_ticker, 0.0) + qty
+        else:
+            shares_held[t_ticker] = max(0.0, shares_held.get(t_ticker, 0.0) - qty)
+
+        # For single-ticker backtests (current design): value = cash + held * price
+        port_val = cash + shares_held.get(t_ticker, 0.0) * price
+        records.append({
+            "timestamp":       trade["timestamp"],
+            "portfolio_value": round(port_val, 2),
+            "action":          t_type,
+        })
+
+    df = pd.DataFrame(records)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    return df, init_cash
+
+
+def _build_equity_chart(equity_df: pd.DataFrame) -> go.Figure:
+    """Plotly line chart of portfolio value with BUY/SELL trade markers."""
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=equity_df["timestamp"],
+        y=equity_df["portfolio_value"],
+        mode="lines",
+        name="Portfolio Value",
+        line=dict(color=_BLUE, width=2),
+        fill="tozeroy",
+        fillcolor="rgba(78,141,245,0.07)",
+    ))
+
+    buys = equity_df[equity_df["action"] == "BUY"]
+    if not buys.empty:
+        fig.add_trace(go.Scatter(
+            x=buys["timestamp"], y=buys["portfolio_value"],
+            mode="markers", name="BUY",
+            marker=dict(color=_GREEN, size=10, symbol="triangle-up"),
+        ))
+
+    sells = equity_df[equity_df["action"] == "SELL"]
+    if not sells.empty:
+        fig.add_trace(go.Scatter(
+            x=sells["timestamp"], y=sells["portfolio_value"],
+            mode="markers", name="SELL",
+            marker=dict(color=_RED, size=10, symbol="triangle-down"),
+        ))
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=420,
+        margin=dict(l=0, r=0, t=28, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor="#1a1a2e", bordercolor="#444", font_size=12),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="right", x=1, font_size=12,
+        ),
+        yaxis=dict(tickprefix="$", tickformat=",.0f"),
+    )
+    fig.update_xaxes(showgrid=False, linecolor="rgba(255,255,255,0.1)", color="#777")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.06)", color="#888")
+    return fig
+
+
 # ── Session-state init ─────────────────────────────────────────────────────
 if "last_refresh" not in st.session_state:
     st.session_state["last_refresh"] = datetime.now()
@@ -311,6 +428,14 @@ if "last_refresh" not in st.session_state:
 with st.sidebar:
     st.title("📈 MarketMind AI")
     st.caption("Paper Trading Simulator · v2")
+    st.divider()
+
+    # ── Mode selector ──────────────────────────────────────────────────────
+    mode: str = st.radio(
+        "Mode",
+        ["📊 Live", "🔬 Backtest"],
+        horizontal=True,
+    )
     st.divider()
 
     # ── Controls ───────────────────────────────────────────────────────────
@@ -372,6 +497,93 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════
 #  MAIN CONTENT
 # ══════════════════════════════════════════════════════════════════════════
+
+# ── Backtest mode: render analysis then stop ────────────────────────────────
+if mode == "🔬 Backtest":
+    st.header("Backtest Analysis")
+
+    if not BACKTEST_DB_PATH.exists():
+        st.warning(
+            "No backtest data found. "
+            "Run `python strategy.py` first to generate `data/backtest.db`."
+        )
+    else:
+        try:
+            equity_df, bt_init_cash = _load_backtest_equity(BACKTEST_DB_PATH)
+
+            if equity_df.empty:
+                st.info("Backtest database exists but contains no trades yet.")
+            else:
+                final_val        = equity_df["portfolio_value"].iloc[-1]
+                total_return_pct = (final_val - bt_init_cash) / bt_init_cash * 100
+                n_trades         = int((equity_df["action"] != "START").sum())
+
+                # ── Sim stats ───────────────────────────────────────────────
+                s1, s2, s3 = st.columns(3)
+                s1.metric("Starting Capital", fmt_usd(bt_init_cash))
+                s2.metric(
+                    "Final Portfolio Value",
+                    fmt_usd(final_val),
+                    delta       = f"{total_return_pct:+.2f}%",
+                    delta_color = "normal",
+                )
+                s3.metric("Number of Trades", n_trades)
+
+                st.divider()
+
+                # ── Equity curve ────────────────────────────────────────────
+                st.subheader("Equity Curve")
+                st.plotly_chart(_build_equity_chart(equity_df), use_container_width=True)
+
+                st.divider()
+
+                # ── Backtest trade history ───────────────────────────────────
+                st.subheader("Trade History")
+                with get_connection(BACKTEST_DB_PATH) as _bt_conn:
+                    bt_trades = [
+                        dict(r) for r in _bt_conn.execute(
+                            """
+                            SELECT timestamp, ticker, type, price,
+                                   quantity, sentiment_score
+                            FROM   trades
+                            ORDER  BY id DESC
+                            LIMIT  50
+                            """
+                        ).fetchall()
+                    ]
+                if bt_trades:
+                    bt_df = pd.DataFrame(bt_trades)
+                    bt_df["timestamp"] = (
+                        pd.to_datetime(bt_df["timestamp"]).dt.strftime("%m-%d %H:%M")
+                    )
+                    bt_df = bt_df.rename(columns={
+                        "timestamp"      : "Time",
+                        "ticker"         : "Ticker",
+                        "type"           : "Type",
+                        "quantity"       : "Qty",
+                        "price"          : "Price",
+                        "sentiment_score": "Sentiment",
+                    })
+                    st.dataframe(
+                        bt_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Type"     : st.column_config.TextColumn(width="small"),
+                            "Price"    : st.column_config.NumberColumn(format="$%.2f"),
+                            "Qty"      : st.column_config.NumberColumn(format="%.4g"),
+                            "Sentiment": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                    )
+                else:
+                    st.caption("No trades in backtest database.")
+
+        except Exception as exc:
+            st.error(f"Failed to load backtest data: {exc}")
+
+    st.stop()  # Skip live-mode content below
+
+# ── Live mode ───────────────────────────────────────────────────────────────
 engine    = _engine()
 portfolio = engine.get_portfolio()
 init_cash = _initial_cash()
