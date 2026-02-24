@@ -8,6 +8,11 @@ pipeline {
         ansiColor('xterm')
     }
 
+    environment {
+        // Force Python à accepter les caractères spéciaux sur Windows
+        PYTHONUTF8 = '1'
+    }
+
     stages {
         stage('🛠️ Setup Environment') {
             steps {
